@@ -1,0 +1,7 @@
+data/
+playground_output/
+output.pkl
+playground.py
+__pycache__/
+*.pyc
+.DS_Store
