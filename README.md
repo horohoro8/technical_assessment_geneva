@@ -1,160 +1,100 @@
----
-title: "Plair Technical Challenge"
-author: Emmanuel Pauchard
-date: Feb 17, 2026
-geometry: margin=2cm
-output: pdf_document
----
-# Data Storage Challenge
+# Plair Data Storage Challenge
 
-## Context
+> This README was generated with the assistance of an LLM (Claude by Anthropic).
 
-Plair manufactures a viable particle counter (see [our
-website](https://www.plair.ch/)). During calibration of our instrument, we
-generate a lot of data from the machine sensors (mainly spectrometers and
-scattering light sensors) which can amount to several gigabytes of data per
-minute. We need to store this data to disk for post-processing and machine
-learning.
+## Overview
 
-## Objective
+This module replaces the naive pickle-based `basic_storage.py` with a
+production-quality storage system capable of handling high-throughput particle
+data from Plair's calibration instruments.
 
-Design and implement a **data storage system** in Python that ingests a
-continuous stream of numerical data from `stdin` and persists it to disk in a
-robust, queryable format.
+## Design
 
-You are provided with:
+### Chunked storage
 
-| File | Description |
-|---|---|
-| `data_generator.py` | Streams random data packets to `stdout`. **Do not modify.** |
-| `basic_storage.py` | Naïve reference implementation (pickle + append). |
+Data is accumulated in memory and written to disk in chunks. This avoids
+opening and closing a file for every packet, which would be extremely slow at
+50,000 particles per second.
 
-Your task is to **replace `basic_storage.py`** with a production-quality storage
-backend that satisfies the requirements below.
+The chunking idea was inspired by a previous signal processing project
+(Boulandet et al., 2021) where audio recordings were partitioned into chunks
+of 128 samples before processing. The same principle applies here: instead of
+processing every particle individually, we batch them together and write them
+all at once when the buffer is full.
 
-Your code should be a python module or package with instructions on how to
-execute in combination with `data_generator.py`. You can reuse the same command
-line interface as the example (last section).
+Each chunk is written as a separate Parquet file named after its first
+timestamp, so files sort chronologically in the directory.
 
-Once ready, send me your code ideally by sharing a link to a github (or other)
-project, or in a tar archive. I will then test your software on my laptop.
+### Storage format: Parquet
 
----
+Parquet was chosen after researching how to store numerical data efficiently
+in Python. It is a binary columnar format that:
 
-## Data Format
+- stores numpy arrays compactly without text conversion overhead
+- is natively supported by pandas via `to_parquet` / `read_parquet`
+- requires no extra configuration (unlike HDF5 which needs PyTables)
+- compresses data automatically
 
-Each packet contains **N particles** (N varies randomly between 1 and 1 000).
-The packet is a Python `dict` with three NumPy arrays:
+Pandas was used as the bridge between numpy arrays and Parquet because it was
+covered extensively during a Python course as the standard tool for handling
+large numerical datasets.
 
-| Key | Shape | Dtype | Description |
-|---|---|---|---|
-| `timestamps` | `(N,)` | `float64` | One timestamp per particle (epoch s) |
-| `scattering` | `(N, 64, 16)` | `int32` | One 64×16 measurement per particle |
-| `spectral` | `(N, 32, 16)` | `int32` | One 32×16 measurement per particle |
+The 2D sensor arrays (`scattering` shape `(N, 64, 16)` and `spectral` shape
+`(N, 32, 16)`) are flattened to `(N, 1024)` and `(N, 512)` respectively
+before storage, since pandas DataFrames are 2D structures. Column names are
+`scat_0 ... scat_1023` and `spec_0 ... spec_511`.
 
-**Data model**: Each particle is one row in your storage. A particle has:
+### Index
 
-- 1 timestamp
-- 1 scattering array (64×16)
-- 1 spectral array (32×16)
+A lightweight `index.csv` file lives alongside the chunk files. Every time a
+chunk is flushed, one row is appended recording the filename and the min/max
+timestamps of that chunk.
 
+On read, the index is consulted first to identify which files overlap the
+query window — all other files are skipped entirely. This makes time-range
+queries efficient regardless of how many total files exist on disk.
 
-Packets arrive as length-prefixed pickled blobs on `stdin` (4-byte big-endian
-length header followed by the pickle payload). See `data_generator.py` for
-details.
-
-### Note:
-
-To keep the generation side simple, all particles in a packet use the same
-timestamp.
-
----
+```
+./data/
+    index.csv                      ← one row per chunk
+    1771582694.281498.parquet      ← chunk file
+    1771582724.918273.parquet      ← next chunk
+    ...
+```
 
 ## Requirements
 
-### Must-have
-
-1. **Storage capacity**: the system must support up to **1 TB** of stored data,
-   **50k particles written per second** and **200k particles read** per second.
-
-1. **Embedded device**: the storage will run on an embedded device. Do not worry
-   about CPU / RAM (consider our device is equivalent to a decent laptop (2Ghz+
-   multi-core and 16Gb+ RAM) and runs a recent Linux distribution), but try to
-   anticipate constraints from this context.
-
-1. **Read access optimised by time range**: provide a read API or CLI that
-   retrieves all rows whose `timestamps` fall within a given `[start, stop]`
-   range efficiently.
-
-1. **Don't reinvent the wheel**. Use as many off-the-shelf Python libraries as
-   you need, while keeping in mind the industrial context.
-
-1. **Python only**: the solution must be implemented in Python.
-
-1. **LLM**: It is ok to use AI assistance. Use it wisely, or not at all: The
-   goal for me is to evaluate if **your** style and skills, not ChatGPT's, will
-   be a good match for our team. By the way, this challenge *has* been generated
-   using a LLM: I wanted to keep it neutral to see your coding style. Be
-   natural!
-
----
-
-## How to Run the example
-
 ```bash
-# tested with Python 3.12 and numpy 2.4.2
-
-# Install dependencies (in a virtual environment)
-python3 -m venv .venv && source .venv/bin/activate
-pip install numpy
-
-# Generate data and pipe into your storage implementation
-python data_generator.py --pps 100 --max-mb 200 \
-    | python your_storage.py write <output_path>
-
-# Generator options:
-#   --pps N       Packets per second (0 = unlimited). Typical: 50-100.
-#   --max-mb N    Stop after N MB sent (0 = unlimited).
-
-# The reference (naïve) implementation: for comparison only
-python data_generator.py --pps 150 --max-mb 500 \
-    | python basic_storage.py --storage-file output.pkl write
-    
-First Data timestamps 2026-02-17T15:32:36.080619+00:00
-Reached 527396279 bytes after 165 packets (85720 particles). Stopping.
-Write bandwidth: 60.58 kParticles/s
-Last Data timestamp 2026-02-17T15:32:37.442515+00:00
-Wrote to storage 165 packets (527396279 bytes).
-
-
-# Read data from storage (to adapt to the timestamps output in previous command)
-python  basic_storage.py --storage-file output.pkl read \
-   --start "2026-02-17T15:32:37" \
-   --stop "2026-02-17T15:32:37.1"
-
-Reading data between 2026-02-17 15:32:37+00:00 and 2026-02-17 15:32:37.100000+00:00
-Found storage data from 2026-02-17 15:04:28.783457+00:00 to 2026-02-17 15:32:37.442515+00:00
-Found 7280 particles.
-Read bandwidth 2.91 kParticles/s.
-    
+pip install numpy pandas pyarrow
 ```
 
----
+## Usage
 
-## Guidelines
+### Write
 
-| Guideline | Detail |
-|---|---|
-| **Time budget** | 2–4 hours maximum. This is a technical screen, not a marathon. |
-| **Scope** | Focus on the storage layer. No need for a GUI, REST API, or database server. A CLI or simple Python API is sufficient. |
-| **Documentation** | Include a short write-up (in code comments or a separate file) explaining your design choices, trade-offs, and what you would improve given more time. |
-| **Focus on storage, not on parsing input data** | To parse input you can reuse `get_packet_from_stream` from the example.|
+```bash
+python data_generator.py --pps 100 --max-mb 200 \
+    | python mark_storage.py --storage-dir ./data write
+```
 
----
+### Read
 
-Do not hurt yourself with this task. The goal is to have a quick view on your
-skills and also a basis for discussion for the next interview. My focus will be
-more on architecture and software good practices than performances. I will even
-accept uncomplete submissions if you document your reasoning well enough.
+First check the index to find the timestamp range of your stored data:
 
-Good luck!
+```bash
+cat ./data/index.csv
+```
+
+Then query using ISO 8601 timestamps that fall within that range:
+
+```bash
+python mark_storage.py --storage-dir ./data read \
+    --start "2026-02-25T10:36:43" \
+    --stop  "2026-02-25T10:36:44"
+```
+
+## Reference
+
+Boulandet, R., Kham, S. R., Marmaroli, P., & Minier, J. (2021).
+*Implementation and performance assessment of a MEMS-based Sound Level Meter.*
+Euronoise 2021, Madeira, Portugal.
